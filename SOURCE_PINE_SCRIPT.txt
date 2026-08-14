@@ -1,0 +1,416 @@
+//@version=6
+indicator("Footprint-Style Order Flow Pro (Estimasi) v3", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// ============ TYPE UNTUK ROLLING POC ============
+// Menyimpan distribusi volume-per-price-level dari 1 bar, dipakai untuk
+// menambah/mengurangi kontribusi bar tsb ke peta volume rolling saat window bergeser.
+type BarBin
+    array<float> prices
+    array<float> vols
+
+// ============ SETTINGS ============
+lowerTF          = input.timeframe("1", "Lower Timeframe untuk Estimasi", group="Umum")
+tickSize         = input.float(1.0, "Ukuran Level Harga (Price Bin)", minval=0.01, group="Umum")
+labelSize        = input.string("tiny", "Ukuran Label", options=["tiny", "small", "normal"], group="Umum")
+maxPriceLevels   = input.int(60, "Maksimal Price Level per Bar (anti-lag)", minval=10, maxval=300, group="Umum", tooltip="Kalau tickSize terlalu kecil di simbol volume tinggi, jumlah level bisa sangat banyak dan bikin script lag/timeout. Level baru di luar batas ini tidak diproses.")
+
+showLabel        = input.bool(true, "Tampilkan Label Delta", group="Delta")
+showCumDelta     = input.bool(true, "Tampilkan Cumulative Delta Line", group="Delta")
+
+showPOC          = input.bool(true, "Tampilkan POC", group="Volume Profile")
+showValueArea    = input.bool(true, "Tampilkan Value Area (VAH/VAL)", group="Volume Profile")
+valueAreaPct     = input.float(0.70, "Persentase Value Area", minval=0.5, maxval=0.95, step=0.05, group="Volume Profile")
+useRollingPOC    = input.bool(true, "Gunakan Rolling POC (bukan per-bar)", group="Volume Profile", tooltip="ON = POC dihitung dari akumulasi volume-per-level di N bar terakhir (level struktural, seperti Volume Profile biasa). OFF = perilaku lama, POC dihitung ulang dari nol tiap candle (kurang berguna untuk analisa struktur).")
+rollingWindowBars = input.int(50, "Rolling Window (jumlah bar)", minval=5, maxval=500, group="Volume Profile", tooltip="Jumlah bar terakhir yang diakumulasi untuk mencari POC/Value Area rolling. Makin besar = level makin stabil tapi makin lambat bereaksi ke perubahan struktur baru.")
+
+imbalanceRatio   = input.float(3.0, "Rasio Imbalance per Level", minval=1.0, group="Imbalance")
+minVolForImb     = input.float(0.0, "Volume Minimum per Level untuk Imbalance", minval=0.0, group="Imbalance", tooltip="Level dengan rasio tinggi tapi volume total (buy+sell) di bawah angka ini tidak dihitung sebagai imbalance. 0 = tidak difilter.")
+minStackCount    = input.int(3, "Minimal Level Beruntun untuk Stacked Imbalance", minval=2, group="Imbalance")
+
+absorptionRatio       = input.float(0.18, "Threshold Absorption (delta/volume)", minval=0.01, maxval=1.0, step=0.01, group="Absorption")
+absorptionMinRangeATR = input.float(0.9, "Minimal Range Candle (x ATR)", minval=0.1, group="Absorption")
+showRatioOnABS         = input.bool(true, "Tampilkan Angka Rasio di Label ABS", group="Absorption")
+
+pivotLen         = input.int(5, "Pivot Lookback Divergence", minval=2, group="Divergence")
+divAlignToPivot  = input.bool(true, "Posisikan Label DIV di Titik Pivot (kalau off, muncul di bar konfirmasi)", group="Divergence")
+maxPivotHistory  = input.int(4, "Jumlah Pivot Terakhir untuk Dibandingkan", minval=2, maxval=8, group="Divergence")
+divCompareLastOnly = input.bool(false, "Bandingkan Hanya ke Pivot Terakhir (bukan seluruh histori)", group="Divergence", tooltip="ON = definisi divergence klasik (dibandingkan ke pivot sebelumnya saja, sinyal lebih jarang tapi lebih ketat). OFF = dibandingkan ke beberapa pivot terakhir sekaligus (sinyal lebih sering, cocok untuk deteksi dini).")
+
+maxBarsBack      = input.int(3000, "Batas Maksimal Bar Diproses (anti-lag)", minval=100, maxval=5000, group="Performa")
+
+labelOffsetMult  = input.float(0.15, "Jarak Label ke Candle (x ATR)", minval=0.05, maxval=1.0, step=0.05, group="Tampilan")
+bullColor        = input.color(color.new(color.green, 0), "Warna Delta Positif", group="Tampilan")
+bearColor        = input.color(color.new(color.red, 0), "Warna Delta Negatif", group="Tampilan")
+pocColor         = input.color(color.yellow, "Warna POC", group="Tampilan")
+vaColor          = input.color(color.new(color.blue, 40), "Warna Value Area", group="Tampilan")
+absorptionColor  = input.color(color.new(color.purple, 70), "Warna Highlight Absorption", group="Tampilan")
+stackBullColor   = input.color(color.new(color.teal, 80), "Warna Highlight Stacked Bullish", group="Tampilan")
+stackBearColor   = input.color(color.new(color.maroon, 80), "Warna Highlight Stacked Bearish", group="Tampilan")
+
+lblSize = labelSize == "tiny" ? size.tiny : labelSize == "small" ? size.small : size.normal
+
+// ============ GUARD: batasi eksekusi biar tidak lag/timeout ============
+withinLimit = bar_index >= (last_bar_index - maxBarsBack)
+
+// ============ AMBIL DATA LOWER TIMEFRAME (dengan proteksi) ============
+[ltfClose, ltfVol] = request.security_lower_tf(syminfo.tickerid, lowerTF, [close, volume])
+
+var float delta = 0.0
+var float pocLevel = na
+var float totalVol = 0.0
+var float vahLevel = na
+var float valLevel = na
+var int bullStackMax = 0
+var int bearStackMax = 0
+
+// ============ STATE ROLLING POC (persisten antar bar) ============
+var array<BarBin> binHistory   = array.new<BarBin>(0)
+var map<float, float> rollVolMap = map.new<float, float>()
+
+if withinLimit and (barstate.isconfirmed or barstate.islast)
+    // --- cek na dan size secara terpisah (nested), bukan digabung "and"
+    // supaya tidak ada risiko array.size() dipanggil saat array masih na ---
+    hasData = false
+    if not na(ltfClose)
+        if array.size(ltfClose) > 0
+            hasData := true
+
+    if hasData
+        var float[] levels = array.new_float(0)
+        var float[] buyAtLevel = array.new_float(0)
+        var float[] sellAtLevel = array.new_float(0)
+        array.clear(levels)
+        array.clear(buyAtLevel)
+        array.clear(sellAtLevel)
+
+        buyTotal = 0.0
+        sellTotal = 0.0
+
+        for i = 0 to array.size(ltfClose) - 1
+            c = array.get(ltfClose, i)
+            v = array.get(ltfVol, i)
+            if not na(c) and not na(v) and tickSize > 0
+                // FIX #1: tick pertama tanpa referensi arah tidak dipaksa "buy".
+                // Volumenya tetap dihitung ke totalVol lewat buyTotal/sellTotal,
+                // tapi diarahkan netral (dibagi rata) alih-alih bias ke buy.
+                prevC = i > 0 ? array.get(ltfClose, i - 1) : na
+                hasDirection = i > 0 and not na(prevC)
+                isBuy = hasDirection ? c > prevC : true
+                isNeutralFirst = not hasDirection
+
+                binPrice = math.round(c / tickSize) * tickSize
+
+                idx = array.indexof(levels, binPrice)
+                // FIX #2: batasi jumlah price level baru yang dibuat per bar
+                canAddNewLevel = idx >= 0 or array.size(levels) < maxPriceLevels
+
+                if canAddNewLevel
+                    if isNeutralFirst
+                        // tick pertama tanpa arah: split 50/50 biar tidak bias ke buy
+                        halfV = v / 2.0
+                        buyTotal += halfV
+                        sellTotal += halfV
+                        if idx < 0
+                            array.push(levels, binPrice)
+                            array.push(buyAtLevel, halfV)
+                            array.push(sellAtLevel, halfV)
+                        else
+                            array.set(buyAtLevel, idx, array.get(buyAtLevel, idx) + halfV)
+                            array.set(sellAtLevel, idx, array.get(sellAtLevel, idx) + halfV)
+                    else
+                        if isBuy
+                            buyTotal += v
+                        else
+                            sellTotal += v
+                        if idx < 0
+                            array.push(levels, binPrice)
+                            array.push(buyAtLevel, isBuy ? v : 0.0)
+                            array.push(sellAtLevel, isBuy ? 0.0 : v)
+                        else
+                            if isBuy
+                                array.set(buyAtLevel, idx, array.get(buyAtLevel, idx) + v)
+                            else
+                                array.set(sellAtLevel, idx, array.get(sellAtLevel, idx) + v)
+
+        delta := buyTotal - sellTotal
+        totalVol := buyTotal + sellTotal
+
+        n = array.size(levels)
+
+        if n >= 2
+            for i = 0 to n - 2
+                minIdx = i
+                for j = i + 1 to n - 1
+                    if array.get(levels, j) < array.get(levels, minIdx)
+                        minIdx := j
+                if minIdx != i
+                    tmpL = array.get(levels, i)
+                    array.set(levels, i, array.get(levels, minIdx))
+                    array.set(levels, minIdx, tmpL)
+                    tmpB = array.get(buyAtLevel, i)
+                    array.set(buyAtLevel, i, array.get(buyAtLevel, minIdx))
+                    array.set(buyAtLevel, minIdx, tmpB)
+                    tmpS = array.get(sellAtLevel, i)
+                    array.set(sellAtLevel, i, array.get(sellAtLevel, minIdx))
+                    array.set(sellAtLevel, minIdx, tmpS)
+
+        if useRollingPOC
+            // ---- ROLLING POC: akumulasi kontribusi bar ini ke peta volume rolling ----
+            if n > 0
+                newBin = BarBin.new(array.copy(levels), array.new_float(0))
+                for i = 0 to n - 1
+                    binVol = array.get(buyAtLevel, i) + array.get(sellAtLevel, i)
+                    array.push(newBin.vols, binVol)
+                    p = array.get(levels, i)
+                    if map.contains(rollVolMap, p)
+                        map.put(rollVolMap, p, map.get(rollVolMap, p) + binVol)
+                    else
+                        map.put(rollVolMap, p, binVol)
+                array.push(binHistory, newBin)
+
+            // ---- keluarkan kontribusi bar paling lama kalau window sudah penuh ----
+            if array.size(binHistory) > rollingWindowBars
+                oldBin = array.shift(binHistory)
+                for i = 0 to array.size(oldBin.prices) - 1
+                    p = array.get(oldBin.prices, i)
+                    v = array.get(oldBin.vols, i)
+                    if map.contains(rollVolMap, p)
+                        remain = map.get(rollVolMap, p) - v
+                        if remain <= 0.000001
+                            map.remove(rollVolMap, p)
+                        else
+                            map.put(rollVolMap, p, remain)
+
+            // ---- cari POC & Value Area dari peta rolling ----
+            keys = map.keys(rollVolMap)
+            kn = array.size(keys)
+            if kn > 0
+                sortedKeys = array.copy(keys)
+                if kn >= 2
+                    for i = 0 to kn - 2
+                        minIdx = i
+                        for j = i + 1 to kn - 1
+                            if array.get(sortedKeys, j) < array.get(sortedKeys, minIdx)
+                                minIdx := j
+                        if minIdx != i
+                            tmpK = array.get(sortedKeys, i)
+                            array.set(sortedKeys, i, array.get(sortedKeys, minIdx))
+                            array.set(sortedKeys, minIdx, tmpK)
+
+                rMaxVol = 0.0
+                rPocIdx = 0
+                rTotalVol = 0.0
+                for i = 0 to kn - 1
+                    vv = map.get(rollVolMap, array.get(sortedKeys, i))
+                    rTotalVol += vv
+                    if vv > rMaxVol
+                        rMaxVol := vv
+                        rPocIdx := i
+                pocLevel := array.get(sortedKeys, rPocIdx)
+
+                if rTotalVol > 0
+                    lowIdx = rPocIdx
+                    highIdx = rPocIdx
+                    vaVol = map.get(rollVolMap, array.get(sortedKeys, rPocIdx))
+                    target = rTotalVol * valueAreaPct
+                    iterCount = 0
+                    maxIter = kn + 2
+                    while vaVol < target and (lowIdx > 0 or highIdx < kn - 1) and iterCount < maxIter
+                        volBelow = lowIdx > 0 ? map.get(rollVolMap, array.get(sortedKeys, lowIdx - 1)) : -1.0
+                        volAbove = highIdx < kn - 1 ? map.get(rollVolMap, array.get(sortedKeys, highIdx + 1)) : -1.0
+                        if volAbove >= volBelow
+                            highIdx := math.min(highIdx + 1, kn - 1)
+                            vaVol += volAbove
+                        else
+                            lowIdx := math.max(lowIdx - 1, 0)
+                            vaVol += volBelow
+                        iterCount += 1
+                    vahLevel := array.get(sortedKeys, highIdx)
+                    valLevel := array.get(sortedKeys, lowIdx)
+            else
+                pocLevel := close
+                vahLevel := na
+                valLevel := na
+        else
+            // ---- PERILAKU LAMA: POC dihitung ulang dari nol tiap bar ----
+            if n > 0
+                maxVol = 0.0
+                pocIdx = 0
+                for i = 0 to n - 1
+                    totalAtLevel = array.get(buyAtLevel, i) + array.get(sellAtLevel, i)
+                    if totalAtLevel > maxVol
+                        maxVol := totalAtLevel
+                        pocIdx := i
+                pocLevel := array.get(levels, pocIdx)
+
+                if totalVol > 0
+                    lowIdx = pocIdx
+                    highIdx = pocIdx
+                    vaVol = array.get(buyAtLevel, pocIdx) + array.get(sellAtLevel, pocIdx)
+                    target = totalVol * valueAreaPct
+                    iterCount = 0
+                    maxIter = n + 2
+                    while vaVol < target and (lowIdx > 0 or highIdx < n - 1) and iterCount < maxIter
+                        volBelow = lowIdx > 0 ? array.get(buyAtLevel, lowIdx - 1) + array.get(sellAtLevel, lowIdx - 1) : -1.0
+                        volAbove = highIdx < n - 1 ? array.get(buyAtLevel, highIdx + 1) + array.get(sellAtLevel, highIdx + 1) : -1.0
+                        if volAbove >= volBelow
+                            highIdx := math.min(highIdx + 1, n - 1)
+                            vaVol += volAbove
+                        else
+                            lowIdx := math.max(lowIdx - 1, 0)
+                            vaVol += volBelow
+                        iterCount += 1
+                    vahLevel := array.get(levels, highIdx)
+                    valLevel := array.get(levels, lowIdx)
+            else
+                pocLevel := close
+                vahLevel := na
+                valLevel := na
+
+        curBull = 0
+        curBear = 0
+        bullStackMax := 0
+        bearStackMax := 0
+        if n > 0
+            for i = 0 to n - 1
+                b = array.get(buyAtLevel, i)
+                s = array.get(sellAtLevel, i)
+                // FIX #4: tambah filter volume minimum per level untuk imbalance
+                levelVol = b + s
+                passVolFilter = minVolForImb <= 0 or levelVol >= minVolForImb
+                isBullImb = passVolFilter and s > 0 and b / s >= imbalanceRatio
+                isBearImb = passVolFilter and b > 0 and s / b >= imbalanceRatio
+                if isBullImb
+                    curBull += 1
+                    bullStackMax := math.max(bullStackMax, curBull)
+                else
+                    curBull := 0
+                if isBearImb
+                    curBear += 1
+                    bearStackMax := math.max(bearStackMax, curBear)
+                else
+                    curBear := 0
+    else
+        delta := 0.0
+        totalVol := 0.0
+
+// ============ ABSORPTION ============
+atrVal = ta.atr(14)
+safeATR = na(atrVal) or atrVal == 0 ? syminfo.mintick * 10 : atrVal
+candleRange = high - low
+deltaToVolRatio = totalVol != 0 ? math.abs(delta) / totalVol : 0.0
+isAbsorption = withinLimit and candleRange >= safeATR * absorptionMinRangeATR and totalVol > 0 and deltaToVolRatio <= absorptionRatio
+
+stackedBull = withinLimit and bullStackMax >= minStackCount
+stackedBear = withinLimit and bearStackMax >= minStackCount
+
+// ============ WARNA CANDLE & BACKGROUND ============
+barColor = delta > 0 ? bullColor : delta < 0 ? bearColor : color.gray
+barcolor(withinLimit ? barColor : na)
+
+bgColorFinal = isAbsorption ? absorptionColor :
+     stackedBear ? stackBearColor :
+     stackedBull ? stackBullColor : na
+bgcolor(bgColorFinal)
+
+// ============ LABEL ============
+if withinLimit and isAbsorption
+    absText = showRatioOnABS ? "A" + str.tostring(math.round(deltaToVolRatio * 100)) + "%" : "A"
+    label.new(bar_index, high + safeATR * labelOffsetMult, text=absText, style=label.style_label_down,
+         color=absorptionColor, textcolor=color.white, size=lblSize)
+
+if withinLimit and (stackedBull or stackedBear)
+    stackText = "S" + str.tostring(stackedBull ? bullStackMax : bearStackMax)
+    label.new(bar_index, stackedBull ? low - safeATR * labelOffsetMult : high + safeATR * labelOffsetMult,
+         text=stackText, style=stackedBull ? label.style_label_up : label.style_label_down,
+         color=stackedBull ? stackBullColor : stackBearColor, textcolor=color.white, size=lblSize)
+
+if withinLimit and showLabel
+    label.new(
+         bar_index, delta >= 0 ? high + safeATR * labelOffsetMult : low - safeATR * labelOffsetMult,
+         text = str.tostring(math.round(delta)),
+         style = delta >= 0 ? label.style_label_down : label.style_label_up,
+         color = delta >= 0 ? bullColor : bearColor,
+         textcolor = color.white,
+         size = lblSize,
+         yloc = yloc.price
+    )
+
+// ============ POC & VALUE AREA PLOT ============
+plotshape(showPOC and withinLimit ? pocLevel : na, title=useRollingPOC ? "Rolling POC" : "POC per Bar", style=shape.circle, location=location.absolute, color=pocColor, size=size.tiny)
+plotshape(showValueArea and withinLimit ? vahLevel : na, title="VAH", style=shape.triangledown, location=location.absolute, color=vaColor, size=size.tiny)
+plotshape(showValueArea and withinLimit ? valLevel : na, title="VAL", style=shape.triangleup, location=location.absolute, color=vaColor, size=size.tiny)
+
+// ============ CUMULATIVE DELTA ============
+var float cumDelta = 0.0
+cumDelta := cumDelta + nz(delta)
+plot(showCumDelta ? cumDelta : na, title="Cumulative Delta", color=color.yellow, linewidth=2, display=display.pane)
+
+// ============ DIVERGENCE DETECTOR ============
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+var float[] phPrices = array.new_float(0)
+var float[] phDeltas = array.new_float(0)
+var float[] plPrices = array.new_float(0)
+var float[] plDeltas = array.new_float(0)
+
+bearishDiv = false
+bullishDiv = false
+
+if not na(ph)
+    deltaAtPivotH = nz(cumDelta[pivotLen])
+    // Guard: cuma loop kalau array benar-benar sudah ada isinya
+    if array.size(phPrices) > 0
+        // FIX #3: opsi bandingkan hanya ke pivot TERAKHIR (definisi klasik),
+        // atau ke seluruh histori (perilaku lama, deteksi lebih sering)
+        if divCompareLastOnly
+            lastIdx = array.size(phPrices) - 1
+            prevPrice = array.get(phPrices, lastIdx)
+            prevDelta = array.get(phDeltas, lastIdx)
+            if ph > prevPrice and deltaAtPivotH < prevDelta
+                bearishDiv := true
+        else
+            for i = 0 to array.size(phPrices) - 1
+                prevPrice = array.get(phPrices, i)
+                prevDelta = array.get(phDeltas, i)
+                if ph > prevPrice and deltaAtPivotH < prevDelta
+                    bearishDiv := true
+    array.push(phPrices, ph)
+    array.push(phDeltas, deltaAtPivotH)
+    if array.size(phPrices) > maxPivotHistory
+        array.shift(phPrices)
+        array.shift(phDeltas)
+
+if not na(pl)
+    deltaAtPivotL = nz(cumDelta[pivotLen])
+    // Guard: cuma loop kalau array benar-benar sudah ada isinya
+    if array.size(plPrices) > 0
+        if divCompareLastOnly
+            lastIdx = array.size(plPrices) - 1
+            prevPrice = array.get(plPrices, lastIdx)
+            prevDelta = array.get(plDeltas, lastIdx)
+            if pl < prevPrice and deltaAtPivotL > prevDelta
+                bullishDiv := true
+        else
+            for i = 0 to array.size(plPrices) - 1
+                prevPrice = array.get(plPrices, i)
+                prevDelta = array.get(plDeltas, i)
+                if pl < prevPrice and deltaAtPivotL > prevDelta
+                    bullishDiv := true
+    array.push(plPrices, pl)
+    array.push(plDeltas, deltaAtPivotL)
+    if array.size(plPrices) > maxPivotHistory
+        array.shift(plPrices)
+        array.shift(plDeltas)
+
+divOffset = divAlignToPivot ? -pivotLen : 0
+plotshape(bearishDiv, title="Bearish Divergence", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, offset=divOffset, text="DIV")
+plotshape(bullishDiv, title="Bullish Divergence", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small, offset=divOffset, text="DIV")
+
+// ============ ALERTS ============
+alertcondition(isAbsorption, title="Absorption Terdeteksi", message="Absorption terdeteksi di {{ticker}}")
+alertcondition(stackedBull, title="Stacked Bullish Imbalance", message="Stacked bullish imbalance di {{ticker}}")
+alertcondition(stackedBear, title="Stacked Bearish Imbalance", message="Stacked bearish imbalance di {{ticker}}")
+alertcondition(bearishDiv, title="Bearish Divergence", message="Bearish delta divergence terdeteksi di {{ticker}}")
+alertcondition(bullishDiv, title="Bullish Divergence", message="Bullish delta divergence terdeteksi di {{ticker}}")

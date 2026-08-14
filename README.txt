@@ -1,0 +1,1 @@
+Offline Android prototype based on the uploaded Pine Script. Live XAUUSD feed and full Pine logic still need implementation.
