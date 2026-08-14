@@ -1,0 +1,44 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Ambil kode
+        uses: actions/checkout@v4
+
+      - name: Siapkan Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Cari dan ekstrak project
+        run: |
+          mkdir project
+          unzip -q FootprintOrderFlowPrototype.zip -d project
+
+      - name: Cari Gradle
+        run: |
+          GRADLEW=$(find project -name gradlew -type f | head -1)
+          if [ -z "$GRADLEW" ]; then
+            echo "gradlew tidak ditemukan"
+            exit 1
+          fi
+          chmod +x "$GRADLEW"
+          echo "GRADLEW=$GRADLEW" >> $GITHUB_ENV
+
+      - name: Build APK
+        run: |
+          cd "$(dirname "$GRADLEW")"
+          ./gradlew assembleDebug
+
+      - name: Simpan APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: FootprintOrderFlowAPK
+          path: '**/build/outputs/apk/debug/*.apk'
