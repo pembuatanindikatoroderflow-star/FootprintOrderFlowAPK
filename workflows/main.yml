@@ -2,21 +2,23 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [utama]
   pull_request:
-    branches: [main]
+    branches: [utama]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run a one-line script
-        run: echo Hello, world!
+      - name: Jalankan skrip satu baris
+        run: echo "Halo, dunia!"
 
-      - name: Run a multi-line script
+      - name: Jalankan skrip multi-baris
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          echo "Tambahkan tindakan lain ke build"
+          echo "Lakukan pengujian"
+          echo "Build selesai"
